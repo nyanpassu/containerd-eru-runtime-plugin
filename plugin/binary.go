@@ -11,10 +11,10 @@ import (
 	"github.com/nyanpassu/containerd-eru-runtime-plugin/runtime"
 )
 
-func init() {
+func Register() {
 	plugin.Register(&plugin.Registration{
-		Type: plugin.RuntimePluginV2,
-		ID:   "task",
+		Type: plugin.RuntimePlugin,
+		ID:   "io.containerd.eru.v2",
 		Requires: []plugin.Type{
 			plugin.MetadataPlugin,
 		},
