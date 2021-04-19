@@ -18,7 +18,6 @@ package runtime
 
 import (
 	"context"
-	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -28,9 +27,11 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/pkg/timeout"
-	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/runtime"
+
+	"github.com/nyanpassu/containerd-eru-runtime-plugin/bundle"
+	"github.com/nyanpassu/containerd-eru-runtime-plugin/common"
+	"github.com/nyanpassu/containerd-eru-runtime-plugin/shim"
 )
 
 // Config for the v2 runtime
@@ -40,7 +41,12 @@ type Config struct {
 }
 
 // New task manager for v2 shims
-func New(ctx context.Context, root, state, containerdAddress, containerdTTRPCAddress string, events *exchange.Exchange, cs containers.Store) (*TaskManager, error) {
+func New(
+	ctx context.Context,
+	root, state, containerdAddress, containerdTTRPCAddress string,
+	events *exchange.Exchange,
+	cs containers.Store,
+) (runtime.PlatformRuntime, error) {
 	for _, d := range []string{root, state} {
 		if err := os.MkdirAll(d, 0711); err != nil {
 			return nil, err
@@ -51,7 +57,7 @@ func New(ctx context.Context, root, state, containerdAddress, containerdTTRPCAdd
 		state:                  state,
 		containerdAddress:      containerdAddress,
 		containerdTTRPCAddress: containerdTTRPCAddress,
-		tasks:                  runtime.NewTaskList(),
+		tasks:                  newTaskList(),
 		events:                 events,
 		containers:             cs,
 	}
@@ -68,23 +74,19 @@ type TaskManager struct {
 	containerdAddress      string
 	containerdTTRPCAddress string
 
-	tasks      *runtime.TaskList
+	tasks      *taskList
 	events     *exchange.Exchange
 	containers containers.Store
 }
 
 // ID of the task manager
 func (m *TaskManager) ID() string {
-	return fmt.Sprintf("%s.%s", plugin.RuntimePluginV2, "task")
+	return common.RuntimeName
 }
 
 // Create a new task
-func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.CreateOpts) (_ runtime.Task, err error) {
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return nil, err
-	}
-	bundle, err := NewBundle(ctx, m.root, m.state, id, opts.Spec.Value)
+func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.CreateOpts) (runtime.Task, error) {
+	bundle, err := bundle.NewBundle(ctx, m.root, m.state, id, opts.Spec.Value)
 	if err != nil {
 		return nil, err
 	}
@@ -93,41 +95,16 @@ func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.Create
 			bundle.Delete()
 		}
 	}()
+	err = bundle.SaveOpts(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 	topts := opts.TaskOptions
 	if topts == nil {
 		topts = opts.RuntimeOptions
 	}
 
-	b := shimBinary(ctx, bundle, opts.Runtime, m.containerdAddress, m.containerdTTRPCAddress, m.events, m.tasks)
-	shim, err := b.Start(ctx, topts, func() {
-		log.G(ctx).WithField("id", id).Info("shim disconnected")
-		_, err := m.tasks.Get(ctx, id)
-		if err != nil {
-			// Task was never started or was already successfully deleted
-			return
-		}
-		cleanupAfterDeadShim(context.Background(), id, ns, m.events, b)
-		// Remove self from the runtime task list. Even though the cleanupAfterDeadShim()
-		// would publish taskExit event, but the shim.Delete() would always failed with ttrpc
-		// disconnect and there is no chance to remove this dead task from runtime task lists.
-		// Thus it's better to delete it here.
-		m.tasks.Delete(ctx, id)
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			dctx, cancel := timeout.WithContext(context.Background(), cleanupTimeout)
-			defer cancel()
-			_, errShim := shim.Delete(dctx)
-			if errShim != nil {
-				shim.Shutdown(dctx)
-				shim.Close()
-			}
-		}
-	}()
-	t, err := shim.Create(ctx, opts)
+	t, err := shim.NewTask(ctx, bundle, opts, m.containerdAddress, m.containerdTTRPCAddress, m.events, m.tasks)
 	if err != nil {
 		return nil, err
 	}
@@ -138,16 +115,6 @@ func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.Create
 // Get a specific task
 func (m *TaskManager) Get(ctx context.Context, id string) (runtime.Task, error) {
 	return m.tasks.Get(ctx, id)
-}
-
-// Add a runtime task
-func (m *TaskManager) Add(ctx context.Context, task runtime.Task) error {
-	return m.tasks.Add(ctx, task)
-}
-
-// Delete a runtime task
-func (m *TaskManager) Delete(ctx context.Context, id string) {
-	m.tasks.Delete(ctx, id)
 }
 
 // Tasks lists all tasks
@@ -200,7 +167,7 @@ func (m *TaskManager) loadTasks(ctx context.Context) error {
 		if len(id) > 0 && id[0] == '.' {
 			continue
 		}
-		bundle, err := LoadBundle(ctx, m.state, id)
+		bundle, err := bundle.LoadBundle(ctx, m.state, id)
 		if err != nil {
 			// fine to return error here, it is a programmer error if the context
 			// does not have a namespace
@@ -217,7 +184,7 @@ func (m *TaskManager) loadTasks(ctx context.Context) error {
 			bundle.Delete()
 			continue
 		}
-		container, err := m.container(ctx, id)
+		err = m.checkContainerExist(ctx, id)
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("loading container %s", id)
 			if err := mount.UnmountAll(filepath.Join(bundle.Path, "rootfs"), 0); err != nil {
@@ -226,33 +193,29 @@ func (m *TaskManager) loadTasks(ctx context.Context) error {
 			bundle.Delete()
 			continue
 		}
-		binaryCall := shimBinary(ctx, bundle, container.Runtime.Name, m.containerdAddress, m.containerdTTRPCAddress, m.events, m.tasks)
-		shim, err := loadShim(ctx, bundle, m.events, m.tasks, func() {
-			log.G(ctx).WithField("id", id).Info("shim disconnected")
-			_, err := m.tasks.Get(ctx, id)
-			if err != nil {
-				// Task was never started or was already successfully deleted
-				return
-			}
-			cleanupAfterDeadShim(context.Background(), id, ns, m.events, binaryCall)
-			// Remove self from the runtime task list.
-			m.tasks.Delete(ctx, id)
-		})
-		if err != nil {
-			cleanupAfterDeadShim(ctx, id, ns, m.events, binaryCall)
-			continue
-		}
-		m.tasks.Add(ctx, shim)
+		m.tasks.Add(ctx, shim.LoadTaskFromBundle(ctx, bundle, m.containerdAddress, m.containerdTTRPCAddress, m.events, m.tasks, func() {}))
 	}
 	return nil
 }
 
-func (m *TaskManager) container(ctx context.Context, id string) (*containers.Container, error) {
-	container, err := m.containers.Get(ctx, id)
+func (m *TaskManager) checkContainerExist(ctx context.Context, id string) error {
+	_, err := m.containers.Get(ctx, id)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &container, nil
+	return nil
+}
+
+func (m *TaskManager) addNewTaskFromSupplier(ctx context.Context, supplier func(onClose func(runtime.Task)) (runtime.Task, error)) error {
+	task, err := supplier(func(task runtime.Task) {
+		log.G(ctx).WithField("id", task.ID()).Info("shim disconnected")
+		m.tasks.Delete(ctx, task)
+	})
+	if err != nil {
+		return err
+	}
+	m.tasks.Add(ctx, task)
+	return nil
 }
 
 func (m *TaskManager) cleanupWorkDirs(ctx context.Context) error {

@@ -8,13 +8,14 @@ import (
 	"github.com/containerd/containerd/plugin"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/nyanpassu/containerd-eru-runtime-plugin/common"
 	"github.com/nyanpassu/containerd-eru-runtime-plugin/runtime"
 )
 
 func Register() {
 	plugin.Register(&plugin.Registration{
 		Type: plugin.RuntimePlugin,
-		ID:   "io.containerd.eru.v2",
+		ID:   common.RuntimeName,
 		Requires: []plugin.Type{
 			plugin.MetadataPlugin,
 		},
